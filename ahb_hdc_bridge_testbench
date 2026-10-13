@@ -1,0 +1,551 @@
+`timescale 1ns/1ps
+
+module tb_ahb_hdc_bridge;
+
+  localparam logic [31:0] Q_BASE = 32'h1000_0000;
+  localparam logic [31:0] C_BASE = 32'h1000_0080;
+  localparam logic [31:0] CSR    = 32'h1000_0100;
+  localparam logic [31:0] RESULT = 32'h1000_0104;
+
+  localparam int BUS_TIMEOUT     = 256;
+  localparam int COMPUTE_TIMEOUT = 4096;
+
+  logic HCLK = 0;
+  always #5 HCLK = ~HCLK;
+
+  logic HRESETn;
+  logic HSEL;
+  logic [31:0] HADDR;
+  logic [1:0] HTRANS;
+  logic HWRITE;
+  logic [2:0] HSIZE;
+  wire HREADY;
+  logic [31:0] HWDATA;
+
+  wire HREADYOUT;
+  wire [31:0] HRDATA;
+  wire HRESP;
+  wire safety_fault_irq;
+
+  // Single-slave AHB-Lite system.
+  assign HREADY = HREADYOUT;
+
+  ahb_hdc_bridge dut (
+    .HCLK(HCLK),
+    .HRESETn(HRESETn),
+    .HSEL(HSEL),
+    .HADDR(HADDR),
+    .HTRANS(HTRANS),
+    .HWRITE(HWRITE),
+    .HSIZE(HSIZE),
+    .HREADY(HREADY),
+    .HWDATA(HWDATA),
+    .HREADYOUT(HREADYOUT),
+    .HRDATA(HRDATA),
+    .HRESP(HRESP),
+    .safety_fault_irq(safety_fault_irq)
+  );
+
+  logic [31:0] query_sw [0:31];
+  logic [31:0] class_sw [0:31];
+
+  // Commands/results for successful pipelined transfers.
+  logic        batch_write [0:63];
+  logic [31:0] batch_addr  [0:63];
+  logic [31:0] batch_data  [0:63];
+  logic [31:0] batch_read  [0:63];
+  integer      batch_waits [0:63];
+
+  integer checks = 0;
+  logic [31:0] rd;
+  logic resp;
+  integer waits;
+  integer expected;
+  logic [35:0] saved_word;
+
+  task automatic check(
+    input logic condition,
+    input string message
+  );
+    if (condition !== 1'b1)
+      $fatal(1, "FAIL: %s at time %0t", message, $time);
+    checks++;
+  endtask
+
+  task automatic bus_idle;
+    HSEL   = 0;
+    HTRANS = 2'b00;
+    HADDR  = 0;
+    HWRITE = 0;
+    HSIZE  = 3'b010;
+  endtask
+
+  task automatic reset_dut;
+    @(negedge HCLK);
+    HRESETn = 0;
+    bus_idle();
+    HWDATA = 0;
+    repeat (4) @(posedge HCLK);
+    @(negedge HCLK);
+    HRESETn = 1;
+    repeat (2) @(posedge HCLK);
+  endtask
+
+  // Single transfer, including ERROR-response validation and timeout.
+  // Drive on falling edges; sample completion on rising edges.
+  task automatic ahb_transfer(
+    input  logic        write_access,
+    input  logic [31:0] address,
+    input  logic [31:0] write_data,
+    output logic [31:0] read_data,
+    output logic        response,
+    output integer      wait_count
+  );
+    integer cycles;
+    logic saw_error_first;
+
+    @(negedge HCLK);
+    HSEL   = 1;
+    HTRANS = 2'b10; // NONSEQ
+    HADDR  = address;
+    HWRITE = write_access;
+    HSIZE  = 3'b010;
+
+    // Address acceptance.
+    cycles = 0;
+    do begin
+      @(posedge HCLK);
+      cycles++;
+      if (cycles > BUS_TIMEOUT)
+        $fatal(1, "Address timeout at %h", address);
+    end while (HREADY !== 1'b1);
+
+    @(negedge HCLK);
+    bus_idle();
+    HWDATA = write_data;
+
+    wait_count     = 0;
+    cycles         = 0;
+    saw_error_first = 0;
+
+    forever begin
+      @(posedge HCLK);
+      cycles++;
+
+      if (cycles > BUS_TIMEOUT)
+        $fatal(1, "Data timeout at %h", address);
+
+      if (HREADY === 1'b1) begin
+        read_data = HRDATA;
+        response  = HRESP;
+
+        if (response === 1'b1)
+          check(saw_error_first,
+                "ERROR must have preceding HREADY-low ERROR cycle");
+        else begin
+          check(response === 1'b0, "Known bus response");
+          check(!saw_error_first,
+                "ERROR first cycle must finish with ERROR");
+        end
+        break;
+      end
+      else begin
+        check(HREADY === 1'b0, "Known HREADY during transfer");
+        wait_count++;
+
+        if (HRESP === 1'b1) begin
+          check(!saw_error_first, "Only one ERROR-low-ready cycle");
+          saw_error_first = 1;
+        end
+        else begin
+          check(HRESP === 1'b0, "Known HRESP during wait");
+          check(!saw_error_first, "ERROR response remains asserted");
+        end
+      end
+    end
+
+    @(negedge HCLK);
+    HWDATA = 0;
+  endtask
+
+  task automatic ahb_write(
+    input logic [31:0] address,
+    input logic [31:0] value,
+    input logic expected_error
+  );
+    logic [31:0] unused_data;
+    logic response;
+    integer stalls;
+
+    ahb_transfer(1, address, value, unused_data, response, stalls);
+    check(response === expected_error,
+          $sformatf("Write response at %h", address));
+
+    if (expected_error)
+      check(stalls == 1, "Rejected write: one ERROR wait cycle");
+  endtask
+
+  task automatic ahb_read(
+    input logic [31:0] address,
+    output logic [31:0] value,
+    input logic expected_error
+  );
+    logic response;
+    integer stalls;
+
+    ahb_transfer(0, address, 0, value, response, stalls);
+    check(response === expected_error,
+          $sformatf("Read response at %h", address));
+
+    if (expected_error)
+      check(stalls == 1, "Rejected read: one ERROR wait cycle");
+  endtask
+
+  // True back-to-back pipeline:
+  // address i+1 overlaps the data phase of transfer i.
+  // This task is for transfers expected to return OKAY.
+  task automatic ahb_back_to_back(input integer count);
+    integer cycles;
+
+    check(count >= 1 && count <= 64, "Valid batch length");
+
+    @(negedge HCLK);
+    HSEL   = 1;
+    HTRANS = 2'b10;
+    HADDR  = batch_addr[0];
+    HWRITE = batch_write[0];
+    HSIZE  = 3'b010;
+
+    @(posedge HCLK);
+    check(HREADY === 1'b1, "Initial batch address accepted");
+
+    for (int i = 0; i < count; i++) begin
+      @(negedge HCLK);
+      HWDATA = batch_data[i];
+
+      if (i + 1 < count) begin
+        HSEL   = 1;
+        HTRANS = 2'b10; // Independent NONSEQ transfers, no idle gap.
+        HADDR  = batch_addr[i+1];
+        HWRITE = batch_write[i+1];
+        HSIZE  = 3'b010;
+      end
+      else
+        bus_idle();
+
+      cycles = 0;
+      batch_waits[i] = 0;
+
+      forever begin
+        @(posedge HCLK);
+        cycles++;
+
+        if (cycles > BUS_TIMEOUT)
+          $fatal(1, "Batch timeout at transfer %0d", i);
+
+        check(HRESP === 1'b0,
+              $sformatf("Batch transfer %0d must return OKAY", i));
+
+        if (HREADY === 1'b1) begin
+          batch_read[i] = HRDATA;
+          break;
+        end
+
+        check(HREADY === 1'b0, "Known batch HREADY");
+        batch_waits[i]++;
+        // Address/control and HWDATA stay unchanged during waits.
+      end
+    end
+
+    @(negedge HCLK);
+    bus_idle();
+    HWDATA = 0;
+  endtask
+
+  function automatic integer reference_distance;
+    integer total;
+    logic [31:0] difference;
+
+    total = 0;
+    for (int word_index = 0; word_index < 32; word_index++) begin
+      difference = query_sw[word_index] ^ class_sw[word_index];
+      for (int bit_index = 0; bit_index < 32; bit_index++)
+        total += difference[bit_index];
+    end
+    return total;
+  endfunction
+
+  task automatic load_vectors;
+    for (int i = 0; i < 32; i++) begin
+      batch_write[i] = 1;
+      batch_addr[i]  = Q_BASE + 4*i;
+      batch_data[i]  = query_sw[i];
+
+      batch_write[i+32] = 1;
+      batch_addr[i+32]  = C_BASE + 4*i;
+      batch_data[i+32]  = class_sw[i];
+    end
+    ahb_back_to_back(64);
+  endtask
+
+  task automatic check_all_words;
+    for (int i = 0; i < 32; i++) begin
+      batch_write[i] = 0;
+      batch_addr[i]  = Q_BASE + 4*i;
+      batch_data[i]  = 0;
+
+      batch_write[i+32] = 0;
+      batch_addr[i+32]  = C_BASE + 4*i;
+      batch_data[i+32]  = 0;
+    end
+
+    ahb_back_to_back(64);
+
+    for (int i = 0; i < 32; i++) begin
+      check(batch_read[i] === query_sw[i],
+            $sformatf("Query SRAM word %0d", i));
+      check(batch_read[i+32] === class_sw[i],
+            $sformatf("Class SRAM word %0d", i));
+      check(batch_waits[i] == 0 && batch_waits[i+32] == 0,
+            "Ordinary SRAM reads have zero wait states");
+    end
+  endtask
+
+  task automatic wait_done;
+    logic [31:0] status;
+    logic completed;
+
+    completed = 0;
+    for (int i = 0; i < COMPUTE_TIMEOUT; i++) begin
+      ahb_read(CSR, status, 0);
+      check(status[3] === 1'b0, "No fault during compute");
+
+      if (status[2] === 1'b1) begin
+        check(status[1] === 1'b0, "DONE implies BUSY cleared");
+        completed = 1;
+        break;
+      end
+    end
+
+    check(completed, "Compute completes before timeout");
+  endtask
+
+  task automatic run_and_compare;
+    integer reference_value;
+    logic [31:0] value;
+
+    reference_value = reference_distance();
+    ahb_write(CSR, 32'h1, 0);
+    wait_done();
+    ahb_read(RESULT, value, 0);
+
+    check(value === reference_value,
+          $sformatf("Distance: RTL=%0d reference=%0d",
+                    value, reference_value));
+  endtask
+
+  initial begin
+    HRESETn = 0;
+    HWDATA = 0;
+    bus_idle();
+
+    reset_dut();
+
+    // 1. RESULT without any prior trigger must not hang.
+    $display("TEST: RESULT before START");
+    ahb_transfer(0, RESULT, 0, rd, resp, waits);
+    check(resp === 0, "Initial RESULT returns OKAY");
+    check(rd === 0, "Reset RESULT is zero");
+    check(waits == 0, "Initial RESULT does not stall");
+
+    // 2. Write and read every word in both SRAMs.
+    $display("TEST: Every SRAM word, back-to-back writes/reads");
+    for (int i = 0; i < 32; i++) begin
+      query_sw[i] = $urandom;
+      class_sw[i] = $urandom;
+    end
+    load_vectors();
+    check_all_words();
+    expected = reference_distance();
+
+    // 3. START followed immediately by RESULT read.
+    // RESULT address overlaps the START data phase.
+    $display("TEST: Immediate RESULT read after START");
+    batch_write[0] = 1;
+    batch_addr[0]  = CSR;
+    batch_data[0]  = 32'h1;
+
+    batch_write[1] = 0;
+    batch_addr[1]  = RESULT;
+    batch_data[1]  = 0;
+
+    ahb_back_to_back(2);
+
+    // These checks reflect the supplied bridge's nonblocking RESULT policy.
+    check(batch_waits[1] == 0,
+          "Immediate RESULT has zero waits in supplied RTL");
+    check(batch_read[1] === 32'h0,
+          "Immediate RESULT returns previous/reset result");
+
+    wait_done();
+    ahb_read(RESULT, rd, 0);
+    check(rd === expected, "Random XOR/popcount reference matches");
+
+    // Boundary result checks: 0 and 1024.
+    $display("TEST: Identical vectors, distance 0");
+    for (int i = 0; i < 32; i++)
+      class_sw[i] = query_sw[i];
+    load_vectors();
+    run_and_compare();
+
+    $display("TEST: Opposite vectors, distance 1024");
+    for (int i = 0; i < 32; i++)
+      class_sw[i] = ~query_sw[i];
+    load_vectors();
+    run_and_compare();
+
+    // 4. Raise safety_fault_irq through a genuine parity fault.
+    $display("TEST: Fault-high START is blocked without hanging");
+    @(negedge HCLK);
+    saved_word = dut.query_mem[0];
+    dut.query_mem[0] = saved_word ^ 36'h1;
+
+    // Read detects corruption, returns ERROR and latches fault_q.
+    ahb_read(Q_BASE, rd, 1);
+    check(safety_fault_irq === 1'b1, "Parity fault raises IRQ");
+
+    // Restore SRAM but leave the sticky fault latched.
+    @(negedge HCLK);
+    dut.query_mem[0] = saved_word;
+
+    ahb_write(CSR, 32'h1, 1);
+    ahb_read(CSR, rd, 0);
+    check(rd[1] === 1'b0, "Rejected START does not set BUSY");
+    check(rd[3] === 1'b1, "Fault remains latched");
+    check(dut.ip_valid === 1'b0, "Rejected START does not launch");
+
+    ahb_transfer(0, RESULT, 0, rd, resp, waits);
+    check(resp === 0 && waits == 0,
+          "RESULT after rejected START does not hang");
+    check(rd === 32'd1024, "Rejected START preserves old result");
+
+    ahb_write(CSR, 32'h8, 0); // FAULT W1C.
+    check(safety_fault_irq === 1'b0, "FAULT W1C clears IRQ");
+
+    // 5. Reset while the core is actually running.
+    $display("TEST: Reset in the middle of compute");
+    ahb_write(CSR, 32'h1, 0);
+
+    begin : wait_for_core
+      logic reached_core;
+      reached_core = 0;
+
+      for (int i = 0; i < COMPUTE_TIMEOUT; i++) begin
+        @(negedge HCLK);
+        if (dut.state_q == 3'd4) begin // S_WAIT
+          reached_core = 1;
+          break;
+        end
+      end
+      check(reached_core, "Reached active core computation");
+    end
+
+    // Assert reset now, not one extra cycle later.
+    HRESETn = 0;
+    bus_idle();
+    HWDATA = 0;
+    repeat (4) @(posedge HCLK);
+    @(negedge HCLK);
+    HRESETn = 1;
+    repeat (2) @(posedge HCLK);
+
+    ahb_read(CSR, rd, 0);
+    check(rd === 0, "Reset clears BUSY/DONE/FAULT");
+    ahb_read(RESULT, rd, 0);
+    check(rd === 0, "Reset clears RESULT");
+    check(safety_fault_irq === 0, "Reset clears IRQ");
+
+    // SRAM is not reset, but validity maps are reset.
+    ahb_read(Q_BASE, rd, 1);
+    ahb_read(C_BASE, rd, 1);
+    ahb_write(CSR, 32'h1, 1); // Incomplete vectors: reject, no hang.
+
+    // Old op_valid must not cause a spurious completion after reset.
+    repeat (32) @(posedge HCLK);
+    ahb_read(CSR, rd, 0);
+    check(rd === 0, "No stale completion after reset");
+
+    // Reload and verify recovery.
+    $display("TEST: Recovery after reset");
+    load_vectors();
+    check_all_words();
+    run_and_compare();
+
+    $display("PASS: All tests completed, %0d checks", checks);
+    $finish;
+  end
+
+  // Independent whole-test watchdog.
+  initial begin
+    #2_000_000;
+    $fatal(1, "Global simulation timeout");
+  end
+
+endmodule
+
+
+// Optional stub: compile with +define+USE_HDC_STUB or -DUSE_HDC_STUB.
+// Do not also compile the real hdc_compute when this macro is enabled.
+`ifdef USE_HDC_STUB
+module hdc_compute #(
+  parameter int D = 1024,
+  parameter int LATENCY = 8
+) (
+  input  logic clk,
+  input  logic rst,
+  input  logic [D-1:0] quer_vect,
+  input  logic [D-1:0] class_vect,
+  input  logic ip_valid,
+  output logic op_valid,
+  output logic [10:0] hamm_dist
+);
+
+  integer remaining;
+  logic [10:0] pending_distance;
+
+  function automatic logic [10:0] popcount(
+    input logic [D-1:0] bits
+  );
+    integer total;
+    total = 0;
+    for (int i = 0; i < D; i++)
+      total += bits[i];
+    return total;
+  endfunction
+
+  always_ff @(posedge clk or posedge rst) begin
+    if (rst) begin
+      remaining        <= 0;
+      pending_distance <= 0;
+      hamm_dist        <= 0;
+      op_valid         <= 0;
+    end
+    else begin
+      op_valid <= 0;
+
+      if (ip_valid) begin
+        pending_distance <= popcount(quer_vect ^ class_vect);
+        remaining <= LATENCY;
+      end
+      else if (remaining > 0) begin
+        remaining <= remaining - 1;
+        if (remaining == 1) begin
+          hamm_dist <= pending_distance;
+          op_valid  <= 1;
+        end
+      end
+    end
+  end
+
+endmodule
+`endif
